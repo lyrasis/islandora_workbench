@@ -4,6 +4,7 @@ import requests
 import re
 import logging
 import xml.etree.ElementTree as ET
+from xml.etree.ElementTree import ElementTree
 import sys
 import os
 from rich.console import Console
@@ -75,7 +76,11 @@ class i7ImportUtilities:
         # MIMETYPE to extension mapping for common types, then let mimetypes guess at others.
         map = {'image/jpeg': '.jpg',
                'image/jp2': '.jp2',
-               'image/png': '.png'
+               'image/png': '.png',
+               'application/xml': '.xml',
+               'text/xml': '.xml',
+                # weirdly, this is what Islandora provides for XML docs
+               'text/xml;charset=UTF-8': '.xml'
                }
         if mimetype in map:
             return map[mimetype]
@@ -142,7 +147,8 @@ class i7ImportUtilities:
             query = f'{query}&fq=RELS_EXT_isMemberOfCollection_uri_s:"info\:fedora/{collection}"'
         if self.config['content_model']:
             model = self.config['content_model']
-            query = f'{query}&fq=RELS_EXT_hasModel_uri_s:"info\:fedora/{model}"'
+            # had to change hasModel_uri_s to hasModel_uri_ms
+            query = f'{query}&fq=RELS_EXT_hasModel_uri_ms:"info\:fedora/{model}"'
         if self.config['solr_filters']:
             for filter in self.config['solr_filters']:
                 for key, value in filter.items():
@@ -150,6 +156,45 @@ class i7ImportUtilities:
 
         # Get the populated CSV from Solr, with the object namespace and field list filters applied.
         return query
+
+    # Returns DC/XML data reformatted in a structure that DSpace's SAF expects
+    def create_dspace_dc_xml(self, row):
+
+        dublin_core = ET.Element('dublin_core')
+
+        for field in row.keys():
+            if re.search("^dc\.", field):
+                if not row[field] == '':
+                    # chopping off dc. for easier processing
+                    clean_field = field.replace('dc.', '')
+                    # cleaning up Solr escapes that aren't parsed by CSV
+                    # have to get create with how to clean this
+                    # because there are multivalued fields that
+                    # have non-delimiter commas
+                    value = row[field].replace('\\,', '%COMMA%').replace('\\', '')
+                    # handling multivalued fields
+                    if clean_field in ['contributor', 'coverage', 'identifier', 'subject', 'type']:
+                        for separate_value in value.split(','):
+                            dcvalue = ET.Element('dcvalue')
+                            separate_value = separate_value.replace('%COMMA%', ',')
+                            dcvalue.text = separate_value
+                            dcvalue.set('element', clean_field)
+                            dcvalue.set('qualifier', 'none')
+                            dublin_core.append(dcvalue)
+                    else:
+                        dcvalue = ET.Element('dcvalue')
+                        value = value.replace('%COMMA%', ',')
+                        dcvalue.text = value
+                        dcvalue.set('element', clean_field)
+                        if re.search("^language", clean_field):
+                            dcvalue.set('qualifier', 'iso')
+                        else:
+                            dcvalue.set('qualifier', 'none')
+                        dublin_core.append(dcvalue)
+                
+        return dublin_core
+
+        
 
     # Validates config.
     def validate(self):
@@ -178,6 +223,49 @@ class i7ImportUtilities:
                     # Save to file with name based on PID and extension based on MIMETYPE
                     obj_file_path = os.path.join(self.config['obj_directory'], obj_basename)
                     open(obj_file_path, 'wb+').write(obj_download_response.content)
+                    return obj_basename
+
+                if self.config['get_file_url'] and obj_extension:
+                    return obj_url
+                if obj_download_response.status_code == 404:
+                    logging.warning(f"{obj_url} not found.")
+                    return None
+
+        except requests.exceptions.RequestException as e:
+            logging.info(e)
+            return None
+
+    # Gets file from i7 installation
+    def get_i7_asset_saf_output(self, pid, datastream, parent_collection_pid, row):
+        try:
+            obj_url = f"{self.config['islandora_base_url']}/islandora/object/{pid}/datastream/{datastream}/download"
+            if self.config['get_file_url']:
+                obj_download_response = requests.head(url=obj_url, allow_redirects=True)
+            else:
+                obj_download_response = requests.get(url=obj_url, allow_redirects=True)
+            if obj_download_response.status_code == 200:
+                # Get MIMETYPE from 'Content-Type' header
+                obj_mimetype = obj_download_response.headers['content-type']
+                obj_extension = self.get_extension_from_mimetype(obj_mimetype)
+                if self.config['fetch_files'] and obj_extension:
+                    obj_filename = pid.replace(':', '_')
+                    obj_basename = obj_filename + obj_extension
+                    obj_directory = os.path.join(self.config['obj_directory'], obj_filename)
+                    if not os.path.exists(obj_directory):
+                        os.makedirs(obj_directory)
+                    # Save to file with name based on PID and extension based on MIMETYPE
+                    obj_file_path = os.path.join(obj_directory, obj_basename)
+                    open(obj_file_path, 'wb+').write(obj_download_response.content)
+                    # Create contents file
+                    open(f"{obj_directory}/contents", 'w').write(obj_basename)
+                    # Create collections file
+                    open(f"{obj_directory}/collections", 'w').write(parent_collection_pid)
+                    # Create DC/XML in SAF format
+                    dc_xml = self.create_dspace_dc_xml(row)
+                    with open(f"{obj_directory}/dublin_core.xml", 'wb') as f:
+                        ElementTree(dc_xml).write(f, encoding='utf-8')
+                    # open(f"{obj_directory}/dublin_core.xml", 'w').write(parent_collection_pid, encoding="utf-8")                    
+
                     return obj_basename
 
                 if self.config['get_file_url'] and obj_extension:

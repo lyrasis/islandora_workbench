@@ -97,11 +97,10 @@ with open(config['csv_output_path'], 'w', newline='') as csvfile:
             row_position = utils.get_percentage(row_count, num_csv_rows)
             pbar(row_position)
             for datastream in config['datastreams']:
-                file = utils.get_i7_asset(row['PID'], datastream)
+                file = utils.get_i7_asset_saf_output(row['PID'], datastream, row['RELS_EXT_isMemberOfCollection_uri_ms'], row)
                 if file:
                     row['file'] = file
-                    # TODO this is why the script only grabbed the XML
-                    # confirmed that commenting this out works
+                    # if you need to grab more than one datastream, uncomment this break
                     # break
 
         if config['id_field'] in headers:
